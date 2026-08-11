@@ -22,6 +22,7 @@ tivermos o link oficial da documentação em mãos.
 
 import base64
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -159,7 +160,18 @@ mcp = FastMCP(
 async def listar_pedidos(situacao: str = "", data_inicial: str = "", data_final: str = "", pagina: int = 1) -> dict:
     """Lista pedidos de venda na Olist/Tiny. Filtros opcionais: situacao
     (ex: 'aberto', 'aprovado', 'faturado'), data_inicial e data_final
-    (formato AAAA-MM-DD), pagina para paginação."""
+    (formato AAAA-MM-DD), pagina para paginação.
+
+    Confirmado em produção: a API da Tiny/Olist EXIGE um período de datas
+    para listar pedidos (sem isso ela responde 400 Bad Request). Se
+    data_inicial/data_final não forem informados, usamos como padrão os
+    últimos 30 dias até hoje, pra essa ferramenta funcionar mesmo sem
+    filtro explícito de data.
+    """
+    if not data_inicial and not data_final:
+        hoje = datetime.date.today()
+        data_final = hoje.isoformat()
+        data_inicial = (hoje - datetime.timedelta(days=30)).isoformat()
     params = {"pagina": pagina}
     if situacao:
         params["situacao"] = situacao
@@ -167,7 +179,7 @@ async def listar_pedidos(situacao: str = "", data_inicial: str = "", data_final:
         params["dataInicial"] = data_inicial
     if data_final:
         params["dataFinal"] = data_final
-    return await _tiny_request("GET", "/pedidos", params=params)  # validar contra docs
+    return await _tiny_request("GET", "/pedidos", params=params)  # confirmado: exige dataInicial/dataFinal
 
 
 @mcp.tool()
@@ -438,4 +450,3 @@ app.mount("/", mcp.streamable_http_app())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-  
