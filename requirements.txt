@@ -1,0 +1,4 @@
+mcp>=1.9,<2
+httpx<1
+uvicorn
+starlette
