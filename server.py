@@ -41,7 +41,15 @@ from mcp.server.fastmcp import FastMCP
 TINY_CLIENT_ID = os.environ["TINY_CLIENT_ID"]
 TINY_CLIENT_SECRET = os.environ["TINY_CLIENT_SECRET"]
 PUBLIC_URL = os.environ["PUBLIC_URL"]  # ex: https://olist-mcp-pliar-production.up.railway.app
-MCP_SECRET = os.environ.get("MCP_SECRET", "")  # bearer token simples pra proteger o conector
+MCP_SECRET = os.environ.get("MCP_SECRET", "")  # bearer token que protege as ferramentas MCP
+
+# Credenciais OAuth que o Claude usa pra se autenticar com ESTE servidor (não
+# confundir com TINY_CLIENT_ID/SECRET, que são pra autenticar com a Olist).
+# O Client ID pode ser fixo; o Client Secret reaproveita o MCP_SECRET pra não
+# precisar de mais uma variável.
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "olist-mcp-pliar")
+OAUTH_CLIENT_SECRET = MCP_SECRET
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TOKENS_PATH = DATA_DIR / "tiny_tokens.json"
@@ -229,10 +237,79 @@ async def health(request):
     return JSONResponse({"status": "ok"})
 
 
-# Rotas que não exigem o bearer token: healthcheck e o próprio fluxo OAuth
-# (o /callback é chamado pelo servidor da Tiny, não por nós, então não pode
-# exigir cabeçalho de autorização nosso).
-PUBLIC_PATHS = {"/health", "/authorize", "/callback", "/favicon.ico"}
+# --------------------------------------------------------------------------
+# OAuth2 (client_credentials) para o PRÓPRIO Claude autenticar com este
+# servidor. Preenche os campos "OAuth Client ID" / "OAuth Client Secret" da
+# tela de conector customizado do Claude. Isso é independente do fluxo OAuth
+# feito acima com a Olist/Tiny.
+# --------------------------------------------------------------------------
+
+async def oauth_metadata(request):
+    return JSONResponse(
+        {
+            "issuer": PUBLIC_URL,
+            "token_endpoint": f"{PUBLIC_URL}/token",
+            "grant_types_supported": ["client_credentials"],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+            ],
+            "response_types_supported": ["token"],
+        }
+    )
+
+
+async def oauth_protected_resource(request):
+    return JSONResponse(
+        {
+            "resource": f"{PUBLIC_URL}/mcp",
+            "authorization_servers": [PUBLIC_URL],
+        }
+    )
+
+
+async def token(request):
+    client_id = None
+    client_secret = None
+
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("basic "):
+        import base64
+
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode()
+            client_id, _, client_secret = decoded.partition(":")
+        except Exception:
+            pass
+
+    if client_id is None:
+        form = await request.form()
+        client_id = form.get("client_id")
+        client_secret = form.get("client_secret")
+
+    if client_id != OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET or client_secret != OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    return JSONResponse(
+        {
+            "access_token": MCP_SECRET,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+    )
+
+
+# Rotas que não exigem o bearer token: healthcheck, o fluxo OAuth com a
+# Olist/Tiny, e a negociação OAuth do próprio Claude com este servidor.
+PUBLIC_PATHS = {
+    "/health",
+    "/authorize",
+    "/callback",
+    "/favicon.ico",
+    "/token",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+}
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -249,7 +326,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
         auth = request.headers.get("authorization", "")
         if auth != f"Bearer {MCP_SECRET}":
-            return PlainTextResponse("Unauthorized", status_code=401)
+            return PlainTextResponse(
+                "Unauthorized",
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer resource_metadata="{PUBLIC_URL}/.well-known/oauth-protected-resource"'
+                    )
+                },
+            )
         return await call_next(request)
 
 
@@ -258,6 +343,9 @@ app = Starlette(
         Route("/authorize", authorize),
         Route("/callback", callback),
         Route("/health", health),
+        Route("/token", token, methods=["POST"]),
+        Route("/.well-known/oauth-authorization-server", oauth_metadata),
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
     ]
 )
 app.add_middleware(BearerAuthMiddleware)
