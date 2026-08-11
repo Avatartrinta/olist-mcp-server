@@ -20,8 +20,12 @@ marcados com comentário "# validar contra docs" — ajustar assim que
 tivermos o link oficial da documentação em mãos.
 """
 
+import base64
+import contextlib
+import hashlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -238,23 +242,34 @@ async def health(request):
 
 
 # --------------------------------------------------------------------------
-# OAuth2 (client_credentials) para o PRÓPRIO Claude autenticar com este
-# servidor. Preenche os campos "OAuth Client ID" / "OAuth Client Secret" da
-# tela de conector customizado do Claude. Isso é independente do fluxo OAuth
-# feito acima com a Olist/Tiny.
+# OAuth2 (Authorization Code + PKCE) para o PRÓPRIO Claude autenticar com
+# este servidor. Fica em /oauth/* de propósito, pra não colidir com
+# /authorize e /callback usados acima no fluxo com a Olist/Tiny.
 # --------------------------------------------------------------------------
+
+# code -> {"code_challenge": str, "redirect_uri": str, "expires_at": float}
+# Armazenamento em memória: cada code é de uso único e expira em minutos,
+# então não precisa persistir em disco.
+_AUTH_CODES: dict[str, dict] = {}
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
 
 async def oauth_metadata(request):
     return JSONResponse(
         {
             "issuer": PUBLIC_URL,
-            "token_endpoint": f"{PUBLIC_URL}/token",
-            "grant_types_supported": ["client_credentials"],
+            "authorization_endpoint": f"{PUBLIC_URL}/oauth/authorize",
+            "token_endpoint": f"{PUBLIC_URL}/oauth/token",
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": [
                 "client_secret_basic",
                 "client_secret_post",
             ],
-            "response_types_supported": ["token"],
         }
     )
 
@@ -268,33 +283,78 @@ async def oauth_protected_resource(request):
     )
 
 
-async def token(request):
+async def oauth_authorize(request):
+    """Primeira perna do Authorization Code + PKCE. Como este servidor é de
+    uso pessoal (um único usuário/empresa), aprova automaticamente — não há
+    tela de login/consentimento separada."""
+    q = request.query_params
+    if q.get("client_id") != OAUTH_CLIENT_ID:
+        return PlainTextResponse("client_id inválido", status_code=400)
+    redirect_uri = q.get("redirect_uri")
+    if not redirect_uri:
+        return PlainTextResponse("redirect_uri obrigatório", status_code=400)
+
+    code = secrets.token_urlsafe(32)
+    _AUTH_CODES[code] = {
+        "code_challenge": q.get("code_challenge", ""),
+        "redirect_uri": redirect_uri,
+        "expires_at": time.time() + 600,
+    }
+    sep = "&" if "?" in redirect_uri else "?"
+    dest = f"{redirect_uri}{sep}code={code}"
+    if q.get("state"):
+        dest += f"&state={q['state']}"
+    return RedirectResponse(dest)
+
+
+async def oauth_token(request):
+    """Segunda perna: troca o code (+ code_verifier do PKCE) por um access
+    token. Também aceita grant_type=refresh_token (devolve o mesmo token,
+    já que ele não expira de fato — simplificação razoável pra um servidor
+    de uso interno de uma pessoa só)."""
+    form = await request.form()
+    grant_type = form.get("grant_type")
+
     client_id = None
     client_secret = None
-
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("basic "):
-        import base64
-
         try:
             decoded = base64.b64decode(auth_header[6:]).decode()
             client_id, _, client_secret = decoded.partition(":")
         except Exception:
             pass
-
     if client_id is None:
-        form = await request.form()
         client_id = form.get("client_id")
         client_secret = form.get("client_secret")
 
     if client_id != OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET or client_secret != OAUTH_CLIENT_SECRET:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
 
+    if grant_type == "refresh_token":
+        return JSONResponse(
+            {"access_token": MCP_SECRET, "token_type": "Bearer", "expires_in": 34560000}
+        )
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    code = form.get("code")
+    entry = _AUTH_CODES.pop(code, None)
+    if not entry or entry["expires_at"] < time.time():
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    code_verifier = form.get("code_verifier", "")
+    expected_challenge = _b64url(hashlib.sha256(code_verifier.encode()).digest())
+    if entry["code_challenge"] and expected_challenge != entry["code_challenge"]:
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE mismatch"}, status_code=400)
+
     return JSONResponse(
         {
             "access_token": MCP_SECRET,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": 34560000,
+            "refresh_token": MCP_SECRET,
         }
     )
 
@@ -306,7 +366,8 @@ PUBLIC_PATHS = {
     "/authorize",
     "/callback",
     "/favicon.ico",
-    "/token",
+    "/oauth/authorize",
+    "/oauth/token",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
 }
@@ -338,15 +399,26 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    # Sem isso, o session_manager do FastMCP nunca inicializa seu task
+    # group interno e toda chamada em /mcp cai com "Task group is not
+    # initialized" — só funciona quando o lifespan é propagado assim.
+    async with mcp.session_manager.run():
+        yield
+
+
 app = Starlette(
     routes=[
         Route("/authorize", authorize),
         Route("/callback", callback),
         Route("/health", health),
-        Route("/token", token, methods=["POST"]),
+        Route("/oauth/authorize", oauth_authorize),
+        Route("/oauth/token", oauth_token, methods=["POST"]),
         Route("/.well-known/oauth-authorization-server", oauth_metadata),
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
-    ]
+    ],
+    lifespan=lifespan,
 )
 app.add_middleware(BearerAuthMiddleware)
 
