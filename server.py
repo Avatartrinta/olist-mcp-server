@@ -28,7 +28,8 @@ from pathlib import Path
 import httpx
 import uvicorn
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.routing import Route
 
 from mcp.server.fastmcp import FastMCP
@@ -228,6 +229,30 @@ async def health(request):
     return JSONResponse({"status": "ok"})
 
 
+# Rotas que não exigem o bearer token: healthcheck e o próprio fluxo OAuth
+# (o /callback é chamado pelo servidor da Tiny, não por nós, então não pode
+# exigir cabeçalho de autorização nosso).
+PUBLIC_PATHS = {"/health", "/authorize", "/callback", "/favicon.ico"}
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Protege as ferramentas MCP com um token fixo (MCP_SECRET). Sem isso,
+    qualquer pessoa que descobrisse a URL do serviço conseguiria consultar e
+    alterar pedidos/estoque/preço na Olist sem nenhuma autenticação."""
+
+    async def dispatch(self, request, call_next):
+        if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+        if not MCP_SECRET:
+            return PlainTextResponse(
+                "MCP_SECRET não configurado no servidor.", status_code=500
+            )
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {MCP_SECRET}":
+            return PlainTextResponse("Unauthorized", status_code=401)
+        return await call_next(request)
+
+
 app = Starlette(
     routes=[
         Route("/authorize", authorize),
@@ -235,6 +260,7 @@ app = Starlette(
         Route("/health", health),
     ]
 )
+app.add_middleware(BearerAuthMiddleware)
 
 # Monta o servidor MCP (transporte HTTP em streaming) na mesma app, em /mcp
 app.mount("/", mcp.streamable_http_app())
