@@ -37,6 +37,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # --------------------------------------------------------------------------
 # Configuração
@@ -143,7 +144,15 @@ async def _tiny_request(method: str, path: str, **kwargs) -> dict:
 # Ferramentas MCP
 # --------------------------------------------------------------------------
 
-mcp = FastMCP("olist-tiny-pliar")
+mcp = FastMCP(
+    "olist-tiny-pliar",
+    # Sem isso, o SDK do MCP só aceita requisições com Host: localhost —
+    # em produção, atrás do domínio real do Railway, toda chamada do
+    # Claude cai com 421 "Invalid Host header". A proteção contra DNS
+    # rebinding não se aplica aqui (não é um servidor local de dev) e já
+    # temos o BearerAuthMiddleware protegendo o acesso.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @mcp.tool()
@@ -429,3 +438,4 @@ app.mount("/", mcp.streamable_http_app())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+  
