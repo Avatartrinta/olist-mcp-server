@@ -463,3 +463,5 @@ app.mount("/", mcp.streamable_http_app())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+# redeploy: o webhook do Railway nao entregou o commit a74ff22
