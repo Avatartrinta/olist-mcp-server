@@ -189,13 +189,26 @@ async def obter_pedido(id_pedido: str) -> dict:
 
 
 @mcp.tool()
-async def listar_produtos(pesquisa: str = "", pagina: int = 1) -> dict:
-    """Lista produtos cadastrados na Olist/Tiny. 'pesquisa' filtra por
-    nome/SKU. 'pagina' para paginação."""
-    params = {"pagina": pagina}
+async def listar_produtos(pesquisa: str = "", codigo: str = "", pagina: int = 1,
+                          limite: int = 100) -> dict:
+    """Lista produtos cadastrados na Olist/Tiny.
+
+    pesquisa : filtra pelo nome do produto
+    codigo   : filtra pelo SKU exato (o mesmo codigo usado no anuncio do ML)
+    pagina   : 1, 2, 3... (ate 100 produtos por pagina)
+    limite   : quantos por pagina, no maximo 100
+
+    A API v3 da Tiny pagina por offset/limit e filtra por nome/codigo. Enviar
+    "pagina"/"pesquisa" fazia a Tiny ignorar os dois e devolver sempre os
+    mesmos 100 primeiros produtos, de um total de 1.339.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
     if pesquisa:
-        params["pesquisa"] = pesquisa
-    return await _tiny_request("GET", "/produtos", params=params)  # validar contra docs
+        params["nome"] = pesquisa
+    if codigo:
+        params["codigo"] = codigo
+    return await _tiny_request("GET", "/produtos", params=params)
 
 
 @mcp.tool()
