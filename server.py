@@ -3,8 +3,8 @@ Conector MCP para a API Olist/Tiny (ERP) - Pliar
 ==================================================
 
 Servidor MCP remoto (HTTP) que expõe ferramentas de leitura e escrita sobre
-a API pública v3 da Tiny/Olist (pedidos, produtos, estoque, preço), para uso
-pelo Claude como um conector custom.
+a API pública v3 da Tiny/Olist (pedidos, produtos, estoque, preço, contatos
+e ordem de compra), para uso pelo Claude como um conector custom.
 
 Todo o código fica aqui, em texto simples, versionado no repositório. Nada é
 escondido em variáveis de ambiente codificadas.
@@ -18,6 +18,10 @@ Os demais endpoints (listagem de pedidos/produtos, atualização de estoque e
 preço) seguem a convenção pública documentada pela Tiny (v3) e estão
 marcados com comentário "# validar contra docs" — ajustar assim que
 tivermos o link oficial da documentação em mãos.
+
+Ordem de compra e contatos (adicionado em 17/08/2026, deployment da Plana):
+confirmados contra a documentação oficial https://api-docs.erp.olist.com/
+(seções "Ordem de Compra" e "Contatos"), não são mais "validar contra docs".
 """
 
 import base64
@@ -235,6 +239,170 @@ async def atualizar_preco(id_produto: str, preco: float, preco_promocional: floa
     if preco_promocional is not None:
         body["precoPromocional"] = preco_promocional
     return await _tiny_request("PUT", f"/produtos/{id_produto}/preco", json=body)  # validar contra docs
+
+
+# --------------------------------------------------------------------------
+# Contatos (fornecedores e clientes) — adicionado 17/08/2026, deployment Plana
+# Endpoints confirmados contra https://api-docs.erp.olist.com/api-reference/contatos/
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+async def listar_contatos(nome: str = "", codigo: str = "", situacao: str = "", pagina: int = 1,
+                          limite: int = 100) -> dict:
+    """Lista contatos cadastrados na Olist/Tiny. A Tiny não separa clientes de
+    fornecedores nessa listagem — use 'nome' pra procurar o fornecedor desejado
+    antes de criar uma ordem de compra (precisa do id do contato).
+
+    situacao: 'A' ativo, 'I' inativo, 'B' bloqueado, 'E' excluido.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if nome:
+        params["nome"] = nome
+    if codigo:
+        params["codigo"] = codigo
+    if situacao:
+        params["situacao"] = situacao
+    return await _tiny_request("GET", "/contatos", params=params)
+
+
+@mcp.tool()
+async def obter_contato(id_contato: str) -> dict:
+    """Retorna os detalhes completos de um contato (cliente ou fornecedor) pelo ID,
+    incluindo CPF/CNPJ, endereço e dados de contato."""
+    return await _tiny_request("GET", f"/contatos/{id_contato}")
+
+
+# --------------------------------------------------------------------------
+# Ordem de compra — adicionado 17/08/2026, deployment Plana (Fase 1)
+# Endpoints confirmados contra https://api-docs.erp.olist.com/api-reference/ordem-de-compra/
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+async def criar_ordem_compra(
+    id_fornecedor: str,
+    itens: list[dict],
+    data: str = "",
+    data_prevista: str = "",
+    condicao: str = "",
+    observacoes: str = "",
+    observacoes_internas: str = "",
+    frete_por_conta: str = "",
+    transportador: str = "",
+    frete: float = None,
+    desconto: float = None,
+    id_categoria: str = "",
+) -> dict:
+    """Cria uma ordem (pedido) de compra na Olist/Tiny para um fornecedor.
+
+    id_fornecedor: ID do contato fornecedor (use listar_contatos/obter_contato
+        pra achar o id antes de chamar isso).
+    itens: lista de dicts, cada um com pelo menos:
+        {"id_produto": "123", "quantidade": 10, "valor": 25.90}
+      campos opcionais por item: "tipo" ("P" produto ou "S" servico, default
+      produto), "informacoes_adicionais", "aliquota_ipi", "valor_icms".
+    data / data_prevista: formato AAAA-MM-DD.
+    frete_por_conta: 'R' remetente, 'D' destinatario, 'T' terceiros,
+      '3' proprio remetente, '4' proprio destinatario, 'S' sem transporte.
+    id_categoria: id da categoria financeira da ordem de compra (opcional).
+
+    Retorna: id da ordem criada, numeroPedido, data e situacao
+      ('0'=Em Aberto, '1'=Atendido, '2'=Cancelado, '3'=Em Andamento).
+    """
+    if not itens:
+        raise ValueError("Informe pelo menos um item: {'id_produto', 'quantidade', 'valor'}.")
+
+    body_itens = []
+    for item in itens:
+        if "id_produto" not in item:
+            raise ValueError(f"Item sem 'id_produto': {item}")
+        produto = {"id": item["id_produto"]}
+        if item.get("tipo"):
+            produto["tipo"] = item["tipo"]
+        body_item = {"produto": produto}
+        if "quantidade" in item:
+            body_item["quantidade"] = item["quantidade"]
+        if "valor" in item:
+            body_item["valor"] = item["valor"]
+        if item.get("informacoes_adicionais"):
+            body_item["informacoesAdicionais"] = item["informacoes_adicionais"]
+        if item.get("aliquota_ipi") is not None:
+            body_item["aliquotaIPI"] = item["aliquota_ipi"]
+        if item.get("valor_icms") is not None:
+            body_item["valorICMS"] = item["valor_icms"]
+        body_itens.append(body_item)
+
+    body = {"contato": {"id": id_fornecedor}, "itens": body_itens}
+    if data:
+        body["data"] = data
+    if data_prevista:
+        body["dataPrevista"] = data_prevista
+    if condicao:
+        body["condicao"] = condicao
+    if observacoes:
+        body["observacoes"] = observacoes
+    if observacoes_internas:
+        body["observacoesInternas"] = observacoes_internas
+    if frete_por_conta:
+        body["fretePorConta"] = frete_por_conta
+    if transportador:
+        body["transportador"] = transportador
+    if frete is not None:
+        body["frete"] = frete
+    if desconto is not None:
+        body["desconto"] = desconto
+    if id_categoria:
+        body["categoria"] = {"id": id_categoria}
+
+    return await _tiny_request("POST", "/ordem-compra", json=body)
+
+
+@mcp.tool()
+async def listar_ordens_compra(
+    numero: str = "",
+    data_inicial: str = "",
+    data_final: str = "",
+    situacao: str = "",
+    nome_fornecedor: str = "",
+    codigo_fornecedor: str = "",
+    pagina: int = 1,
+    limite: int = 100,
+) -> dict:
+    """Lista ordens de compra cadastradas na Olist/Tiny.
+    situacao: '0' Em Aberto, '1' Atendido, '2' Cancelado, '3' Em Andamento.
+    nome_fornecedor / codigo_fornecedor: filtra pelo fornecedor.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if numero:
+        params["numero"] = numero
+    if data_inicial:
+        params["dataInicial"] = data_inicial
+    if data_final:
+        params["dataFinal"] = data_final
+    if situacao:
+        params["situacao"] = situacao
+    if nome_fornecedor:
+        params["nomeFornecedor"] = nome_fornecedor
+    if codigo_fornecedor:
+        params["codigoFornecedor"] = codigo_fornecedor
+    return await _tiny_request("GET", "/ordem-compra", params=params)
+
+
+@mcp.tool()
+async def obter_ordem_compra(id_ordem_compra: str) -> dict:
+    """Retorna os detalhes completos de uma ordem de compra pelo ID: itens,
+    fornecedor, parcelas, frete e situação."""
+    return await _tiny_request("GET", f"/ordem-compra/{id_ordem_compra}")
+
+
+@mcp.tool()
+async def atualizar_situacao_ordem_compra(id_ordem_compra: str, situacao: int) -> dict:
+    """Atualiza a situação de uma ordem de compra existente.
+    situacao: 0 Em Aberto, 1 Atendido, 2 Cancelado, 3 Em Andamento."""
+    return await _tiny_request(
+        "PUT", f"/ordem-compra/{id_ordem_compra}/situacao", json={"situacao": situacao}
+    )
 
 
 @mcp.tool()
@@ -463,5 +631,3 @@ app.mount("/", mcp.streamable_http_app())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-# redeploy: o webhook do Railway nao entregou o commit a74ff
