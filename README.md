@@ -1,22 +1,36 @@
 """
-Conector MCP Olist/Tiny — PLIAR  (v2)
+Conector MCP para a API Olist/Tiny (ERP) - Pliar
+==================================================
 
-Mudanca em relacao a v1:
-  - NAO anuncia mais OAuth para o cliente MCP. O endpoint /mcp aceita o segredo
-    de duas formas: cabecalho "Authorization: Bearer <MCP_SECRET>" OU parametro
-    de URL "?t=<MCP_SECRET>". Sem OAuth, sem registro dinamico de cliente.
-  - Requisicao sem segredo responde 403 (e nao 401). O 401 e o que faz o cliente
-    iniciar a descoberta de OAuth; com 403 ele simplesmente reporta o erro.
-  - As rotas de descoberta de OAuth respondem 404 explicitamente, para o caso de
-    alguma biblioteca tentar registra-las por conta propria.
-  - Ferramentas novas: buscar_produto_por_sku, estrutura_produto (composicao de
-    kit) e chamar_api_tiny (passagem direta, para explorar a API v3).
+Servidor MCP remoto (HTTP) que expõe ferramentas de leitura e escrita sobre
+a API pública v3 da Tiny/Olist (pedidos, produtos, estoque, preço, contatos
+e ordem de compra), para uso pelo Claude como um conector custom.
 
-O fluxo OAuth com a propria Olist/Tiny continua igual: /authorize -> /callback.
+Todo o código fica aqui, em texto simples, versionado no repositório. Nada é
+escondido em variáveis de ambiente codificadas.
+
+Endpoints da Tiny confirmados em produção (via logs do nf-automatica):
+  - Token OAuth2:  POST https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token
+  - Pedido:        GET  https://api.tiny.com.br/public-api/v3/pedidos/{id}
+  - Produto:       GET  https://api.tiny.com.br/public-api/v3/produtos/{id}
+
+Os demais endpoints (listagem de pedidos/produtos, atualização de estoque e
+preço) seguem a convenção pública documentada pela Tiny (v3) e estão
+marcados com comentário "# validar contra docs" — ajustar assim que
+tivermos o link oficial da documentação em mãos.
+
+Ordem de compra e contatos (adicionado em 17/08/2026, deployment da Plana):
+confirmados contra a documentação oficial https://api-docs.erp.olist.com/
+(seções "Ordem de Compra" e "Contatos"), não são mais "validar contra docs".
 """
 
+import base64
+import contextlib
+import datetime
+import hashlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -28,15 +42,24 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # --------------------------------------------------------------------------
-# Configuracao
+# Configuração
 # --------------------------------------------------------------------------
 
 TINY_CLIENT_ID = os.environ["TINY_CLIENT_ID"]
 TINY_CLIENT_SECRET = os.environ["TINY_CLIENT_SECRET"]
-PUBLIC_URL = os.environ["PUBLIC_URL"]
-MCP_SECRET = os.environ.get("MCP_SECRET", "")
+PUBLIC_URL = os.environ["PUBLIC_URL"]  # ex: https://olist-mcp-pliar-production.up.railway.app
+MCP_SECRET = os.environ.get("MCP_SECRET", "")  # bearer token que protege as ferramentas MCP
+
+# Credenciais OAuth que o Claude usa pra se autenticar com ESTE servidor (não
+# confundir com TINY_CLIENT_ID/SECRET, que são pra autenticar com a Olist).
+# O Client ID pode ser fixo; o Client Secret reaproveita o MCP_SECRET pra não
+# precisar de mais uma variável.
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "olist-mcp-pliar")
+OAUTH_CLIENT_SECRET = MCP_SECRET
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TOKENS_PATH = DATA_DIR / "tiny_tokens.json"
@@ -77,7 +100,7 @@ async def _refresh_tokens():
     tokens = _load_tokens()
     if not tokens or "refresh_token" not in tokens:
         raise RuntimeError(
-            "Sem refresh_token salvo. Autorize uma vez em "
+            "Sem refresh_token salvo. É preciso autorizar uma vez em "
             f"{PUBLIC_URL}/authorize antes de usar as ferramentas."
         )
     async with httpx.AsyncClient(timeout=30) as client:
@@ -92,6 +115,7 @@ async def _refresh_tokens():
         )
         resp.raise_for_status()
         new_tokens = resp.json()
+        # Tiny nem sempre devolve um novo refresh_token; mantém o antigo se faltar
         new_tokens.setdefault("refresh_token", tokens["refresh_token"])
         _save_tokens(new_tokens)
         return new_tokens
@@ -101,56 +125,290 @@ async def _get_access_token() -> str:
     tokens = _load_tokens()
     if not tokens:
         raise RuntimeError(
-            f"Conector ainda nao autorizado. Acesse {PUBLIC_URL}/authorize uma vez."
+            f"Conector ainda não autorizado. Acesse {PUBLIC_URL}/authorize "
+            "uma vez para conceder acesso (login na Olist/Tiny)."
         )
+    # renova um pouco antes de expirar (expires_in vem em segundos)
     expires_in = tokens.get("expires_in", 14400)
     if time.time() - tokens.get("obtained_at", 0) > expires_in - 120:
         tokens = await _refresh_tokens()
     return tokens["access_token"]
 
 
-async def _tiny_request(method: str, path: str, **kwargs):
+async def _tiny_request(method: str, path: str, **kwargs) -> dict:
     token = await _get_access_token()
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.request(method, f"{TINY_API_BASE}{path}", headers=headers, **kwargs)
-        if resp.status_code >= 400:
-            return {"erro_http": resp.status_code, "detalhe": resp.text[:1500],
-                    "url": str(resp.request.url)}
-        if not resp.content:
-            return {"ok": True, "status": resp.status_code}
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": True, "status": resp.status_code, "texto": resp.text[:1500]}
+        resp.raise_for_status()
+        return resp.json()
 
 
 # --------------------------------------------------------------------------
 # Ferramentas MCP
 # --------------------------------------------------------------------------
 
-# A protecao contra DNS rebinding do SDK valida o cabecalho Host e, com a lista
-# vazia, recusa o dominio do Railway. Quem protege este servidor e o MCP_SECRET,
-# entao a validacao de Host e desligada de proposito. Versoes antigas do SDK nao
-# tem esse parametro — nesse caso cai no construtor simples.
-try:
-    from mcp.server.transport_security import TransportSecuritySettings
+mcp = FastMCP(
+    "olist-tiny-pliar",
+    # Sem isso, o SDK do MCP só aceita requisições com Host: localhost —
+    # em produção, atrás do domínio real do Railway, toda chamada do
+    # Claude cai com 421 "Invalid Host header". A proteção contra DNS
+    # rebinding não se aplica aqui (não é um servidor local de dev) e já
+    # temos o BearerAuthMiddleware protegendo o acesso.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
-    mcp = FastMCP(
-        "olist-tiny-pliar",
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+
+@mcp.tool()
+async def listar_pedidos(situacao: str = "", data_inicial: str = "", data_final: str = "", pagina: int = 1) -> dict:
+    """Lista pedidos de venda na Olist/Tiny. Filtros opcionais: situacao
+    (ex: 'aberto', 'aprovado', 'faturado'), data_inicial e data_final
+    (formato AAAA-MM-DD), pagina para paginação.
+
+    Confirmado em produção: a API da Tiny/Olist EXIGE um período de datas
+    para listar pedidos (sem isso ela responde 400 Bad Request). Se
+    data_inicial/data_final não forem informados, usamos como padrão os
+    últimos 30 dias até hoje, pra essa ferramenta funcionar mesmo sem
+    filtro explícito de data.
+    """
+    if not data_inicial and not data_final:
+        hoje = datetime.date.today()
+        data_final = hoje.isoformat()
+        data_inicial = (hoje - datetime.timedelta(days=30)).isoformat()
+    params = {"pagina": pagina}
+    if situacao:
+        params["situacao"] = situacao
+    if data_inicial:
+        params["dataInicial"] = data_inicial
+    if data_final:
+        params["dataFinal"] = data_final
+    return await _tiny_request("GET", "/pedidos", params=params)  # confirmado: exige dataInicial/dataFinal
+
+
+@mcp.tool()
+async def obter_pedido(id_pedido: str) -> dict:
+    """Retorna os detalhes completos de um pedido específico pelo ID."""
+    return await _tiny_request("GET", f"/pedidos/{id_pedido}")
+
+
+@mcp.tool()
+async def listar_produtos(pesquisa: str = "", codigo: str = "", pagina: int = 1,
+                          limite: int = 100) -> dict:
+    """Lista produtos cadastrados na Olist/Tiny.
+
+    pesquisa : filtra pelo nome do produto
+    codigo   : filtra pelo SKU exato (o mesmo codigo usado no anuncio do ML)
+    pagina   : 1, 2, 3... (ate 100 produtos por pagina)
+    limite   : quantos por pagina, no maximo 100
+
+    A API v3 da Tiny pagina por offset/limit e filtra por nome/codigo. Enviar
+    "pagina"/"pesquisa" fazia a Tiny ignorar os dois e devolver sempre os
+    mesmos 100 primeiros produtos, de um total de 1.339.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if pesquisa:
+        params["nome"] = pesquisa
+    if codigo:
+        params["codigo"] = codigo
+    return await _tiny_request("GET", "/produtos", params=params)
+
+
+@mcp.tool()
+async def obter_produto(id_produto: str) -> dict:
+    """Retorna os detalhes completos de um produto (inclui estoque e preço) pelo ID."""
+    return await _tiny_request("GET", f"/produtos/{id_produto}")
+
+
+@mcp.tool()
+async def atualizar_estoque(id_produto: str, quantidade: float, tipo: str = "B", deposito: str = "") -> dict:
+    """Atualiza o estoque de um produto.
+    tipo: 'B' = define o saldo (balanço), 'E' = entrada, 'S' = saída.
+    deposito: nome/ID do depósito, se a conta usar múltiplos depósitos."""
+    body = {"produto": {"id": id_produto}, "tipo": tipo, "quantidade": quantidade}
+    if deposito:
+        body["deposito"] = {"nome": deposito}
+    return await _tiny_request("POST", f"/estoque/{id_produto}", json=body)  # validar contra docs
+
+
+@mcp.tool()
+async def atualizar_preco(id_produto: str, preco: float, preco_promocional: float = None) -> dict:
+    """Atualiza o preço de venda (e opcionalmente o preço promocional) de um produto."""
+    body = {"preco": preco}
+    if preco_promocional is not None:
+        body["precoPromocional"] = preco_promocional
+    return await _tiny_request("PUT", f"/produtos/{id_produto}/preco", json=body)  # validar contra docs
+
+
+# --------------------------------------------------------------------------
+# Contatos (fornecedores e clientes) — adicionado 17/08/2026, deployment Plana
+# Endpoints confirmados contra https://api-docs.erp.olist.com/api-reference/contatos/
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+async def listar_contatos(nome: str = "", codigo: str = "", situacao: str = "", pagina: int = 1,
+                          limite: int = 100) -> dict:
+    """Lista contatos cadastrados na Olist/Tiny. A Tiny não separa clientes de
+    fornecedores nessa listagem — use 'nome' pra procurar o fornecedor desejado
+    antes de criar uma ordem de compra (precisa do id do contato).
+
+    situacao: 'A' ativo, 'I' inativo, 'B' bloqueado, 'E' excluido.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if nome:
+        params["nome"] = nome
+    if codigo:
+        params["codigo"] = codigo
+    if situacao:
+        params["situacao"] = situacao
+    return await _tiny_request("GET", "/contatos", params=params)
+
+
+@mcp.tool()
+async def obter_contato(id_contato: str) -> dict:
+    """Retorna os detalhes completos de um contato (cliente ou fornecedor) pelo ID,
+    incluindo CPF/CNPJ, endereço e dados de contato."""
+    return await _tiny_request("GET", f"/contatos/{id_contato}")
+
+
+# --------------------------------------------------------------------------
+# Ordem de compra — adicionado 17/08/2026, deployment Plana (Fase 1)
+# Endpoints confirmados contra https://api-docs.erp.olist.com/api-reference/ordem-de-compra/
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+async def criar_ordem_compra(
+    id_fornecedor: str,
+    itens: list[dict],
+    data: str = "",
+    data_prevista: str = "",
+    condicao: str = "",
+    observacoes: str = "",
+    observacoes_internas: str = "",
+    frete_por_conta: str = "",
+    transportador: str = "",
+    frete: float = None,
+    desconto: float = None,
+    id_categoria: str = "",
+) -> dict:
+    """Cria uma ordem (pedido) de compra na Olist/Tiny para um fornecedor.
+
+    id_fornecedor: ID do contato fornecedor (use listar_contatos/obter_contato
+        pra achar o id antes de chamar isso).
+    itens: lista de dicts, cada um com pelo menos:
+        {"id_produto": "123", "quantidade": 10, "valor": 25.90}
+      campos opcionais por item: "tipo" ("P" produto ou "S" servico, default
+      produto), "informacoes_adicionais", "aliquota_ipi", "valor_icms".
+    data / data_prevista: formato AAAA-MM-DD.
+    frete_por_conta: 'R' remetente, 'D' destinatario, 'T' terceiros,
+      '3' proprio remetente, '4' proprio destinatario, 'S' sem transporte.
+    id_categoria: id da categoria financeira da ordem de compra (opcional).
+
+    Retorna: id da ordem criada, numeroPedido, data e situacao
+      ('0'=Em Aberto, '1'=Atendido, '2'=Cancelado, '3'=Em Andamento).
+    """
+    if not itens:
+        raise ValueError("Informe pelo menos um item: {'id_produto', 'quantidade', 'valor'}.")
+
+    body_itens = []
+    for item in itens:
+        if "id_produto" not in item:
+            raise ValueError(f"Item sem 'id_produto': {item}")
+        produto = {"id": item["id_produto"]}
+        if item.get("tipo"):
+            produto["tipo"] = item["tipo"]
+        body_item = {"produto": produto}
+        if "quantidade" in item:
+            body_item["quantidade"] = item["quantidade"]
+        if "valor" in item:
+            body_item["valor"] = item["valor"]
+        if item.get("informacoes_adicionais"):
+            body_item["informacoesAdicionais"] = item["informacoes_adicionais"]
+        if item.get("aliquota_ipi") is not None:
+            body_item["aliquotaIPI"] = item["aliquota_ipi"]
+        if item.get("valor_icms") is not None:
+            body_item["valorICMS"] = item["valor_icms"]
+        body_itens.append(body_item)
+
+    body = {"contato": {"id": id_fornecedor}, "itens": body_itens}
+    if data:
+        body["data"] = data
+    if data_prevista:
+        body["dataPrevista"] = data_prevista
+    if condicao:
+        body["condicao"] = condicao
+    if observacoes:
+        body["observacoes"] = observacoes
+    if observacoes_internas:
+        body["observacoesInternas"] = observacoes_internas
+    if frete_por_conta:
+        body["fretePorConta"] = frete_por_conta
+    if transportador:
+        body["transportador"] = transportador
+    if frete is not None:
+        body["frete"] = frete
+    if desconto is not None:
+        body["desconto"] = desconto
+    if id_categoria:
+        body["categoria"] = {"id": id_categoria}
+
+    return await _tiny_request("POST", "/ordem-compra", json=body)
+
+
+@mcp.tool()
+async def listar_ordens_compra(
+    numero: str = "",
+    data_inicial: str = "",
+    data_final: str = "",
+    situacao: str = "",
+    nome_fornecedor: str = "",
+    codigo_fornecedor: str = "",
+    pagina: int = 1,
+    limite: int = 100,
+) -> dict:
+    """Lista ordens de compra cadastradas na Olist/Tiny.
+    situacao: '0' Em Aberto, '1' Atendido, '2' Cancelado, '3' Em Andamento.
+    nome_fornecedor / codigo_fornecedor: filtra pelo fornecedor.
+    """
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if numero:
+        params["numero"] = numero
+    if data_inicial:
+        params["dataInicial"] = data_inicial
+    if data_final:
+        params["dataFinal"] = data_final
+    if situacao:
+        params["situacao"] = situacao
+    if nome_fornecedor:
+        params["nomeFornecedor"] = nome_fornecedor
+    if codigo_fornecedor:
+        params["codigoFornecedor"] = codigo_fornecedor
+    return await _tiny_request("GET", "/ordem-compra", params=params)
+
+
+@mcp.tool()
+async def obter_ordem_compra(id_ordem_compra: str) -> dict:
+    """Retorna os detalhes completos de uma ordem de compra pelo ID: itens,
+    fornecedor, parcelas, frete e situação."""
+    return await _tiny_request("GET", f"/ordem-compra/{id_ordem_compra}")
+
+
+@mcp.tool()
+async def atualizar_situacao_ordem_compra(id_ordem_compra: str, situacao: int) -> dict:
+    """Atualiza a situação de uma ordem de compra existente.
+    situacao: 0 Em Aberto, 1 Atendido, 2 Cancelado, 3 Em Andamento."""
+    return await _tiny_request(
+        "PUT", f"/ordem-compra/{id_ordem_compra}/situacao", json={"situacao": situacao}
     )
-    print("[boot] transport_security desligado", flush=True)
-except Exception as _e:  # SDK antigo
-    print(f"[boot] sem transport_security ({_e})", flush=True)
-    mcp = FastMCP("olist-tiny-pliar")
 
 
 @mcp.tool()
 async def status_conexao() -> dict:
-    """Verifica se o conector ja foi autorizado com a Olist/Tiny e se o token esta valido.
-    Use isso primeiro se qualquer outra ferramenta falhar."""
+    """Verifica se o conector já foi autorizado com a Olist/Tiny e se o
+    token está válido. Use isso primeiro se outra ferramenta falhar."""
     tokens = _load_tokens()
     if not tokens:
         return {"autorizado": False, "acao_necessaria": f"Acesse {PUBLIC_URL}/authorize"}
@@ -159,134 +417,8 @@ async def status_conexao() -> dict:
     return {"autorizado": True, "token_expira_em_segundos": max(0, int(restante))}
 
 
-@mcp.tool()
-async def listar_produtos(pesquisa: str = "", pagina: int = 1, limite: int = 100) -> dict:
-    """Lista produtos cadastrados na Olist/Tiny. 'pesquisa' filtra por nome ou SKU."""
-    params = {"pagina": pagina, "limit": limite}
-    if pesquisa:
-        params["pesquisa"] = pesquisa
-    return await _tiny_request("GET", "/produtos", params=params)
-
-
-@mcp.tool()
-async def obter_produto(id_produto: str) -> dict:
-    """Retorna os dados completos de um produto pelo ID interno da Olist/Tiny."""
-    return await _tiny_request("GET", f"/produtos/{id_produto}")
-
-
-@mcp.tool()
-async def buscar_produto_por_sku(sku: str) -> dict:
-    """Localiza um produto pelo codigo/SKU. E o SKU do anuncio do Mercado Livre que
-    corresponde ao codigo do produto na Olist — use esta ferramenta para fazer a ponte
-    entre um anuncio do ML e o produto no ERP."""
-    dados = await _tiny_request("GET", "/produtos", params={"codigo": sku, "limit": 50})
-    if isinstance(dados, dict) and dados.get("erro_http"):
-        dados = await _tiny_request("GET", "/produtos", params={"pesquisa": sku, "limit": 50})
-    itens = dados.get("itens") or dados.get("produtos") or dados.get("data") or []
-    exatos = [p for p in itens
-              if str(p.get("sku") or p.get("codigo") or "").strip().lower() == sku.strip().lower()]
-    return {"sku": sku, "encontrados": len(itens),
-            "exatos": exatos, "todos": itens if not exatos else None}
-
-
-@mcp.tool()
-async def estrutura_produto(id_produto: str) -> dict:
-    """Retorna a estrutura (composicao) de um produto do tipo kit: quais produtos o
-    formam e em que quantidade. Use depois de buscar_produto_por_sku para descobrir
-    de que pecas um kit e feito.
-
-    Tenta o endpoint dedicado de estrutura e, se ele nao existir, cai para os campos
-    de composicao que vierem dentro do proprio produto.
-    """
-    est = await _tiny_request("GET", f"/produtos/{id_produto}/estrutura")
-    if isinstance(est, dict) and not est.get("erro_http"):
-        return {"id_produto": id_produto, "origem": "endpoint_estrutura", "estrutura": est}
-    prod = await _tiny_request("GET", f"/produtos/{id_produto}")
-    if isinstance(prod, dict) and prod.get("erro_http"):
-        return {"id_produto": id_produto, "erro": prod}
-    comp = None
-    for chave in ("estrutura", "kit", "composicao", "produtosKit", "itensKit"):
-        if prod.get(chave):
-            comp = {chave: prod[chave]}
-            break
-    return {"id_produto": id_produto, "origem": "campos_do_produto",
-            "tipo": prod.get("tipo"), "composicao": comp,
-            "produto_bruto": prod if comp is None else None}
-
-
-@mcp.tool()
-async def listar_pedidos(situacao: str = "", data_inicial: str = "", data_final: str = "",
-                         pagina: int = 1) -> dict:
-    """Lista pedidos de venda. Datas no formato AAAA-MM-DD."""
-    params = {"pagina": pagina}
-    if situacao:
-        params["situacao"] = situacao
-    if data_inicial:
-        params["dataInicial"] = data_inicial
-    if data_final:
-        params["dataFinal"] = data_final
-    return await _tiny_request("GET", "/pedidos", params=params)
-
-
-@mcp.tool()
-async def obter_pedido(id_pedido: str) -> dict:
-    """Retorna os detalhes completos de um pedido pelo ID."""
-    return await _tiny_request("GET", f"/pedidos/{id_pedido}")
-
-
-@mcp.tool()
-async def atualizar_estoque(id_produto: str, quantidade: float, tipo: str = "B",
-                            deposito: str = "", confirm: bool = False) -> dict:
-    """Atualiza o estoque de um produto. tipo: 'B' saldo, 'E' entrada, 'S' saida.
-    So grava com confirm=true."""
-    body = {"produto": {"id": id_produto}, "tipo": tipo, "quantidade": quantidade}
-    if deposito:
-        body["deposito"] = {"nome": deposito}
-    if not confirm:
-        return {"previa": True, "aviso": "nada gravado — repita com confirm=true", "corpo": body}
-    return await _tiny_request("POST", f"/estoque/{id_produto}", json=body)
-
-
-@mcp.tool()
-async def atualizar_preco(id_produto: str, preco: float, preco_promocional: float = None,
-                          confirm: bool = False) -> dict:
-    """Atualiza o preco de venda (e opcionalmente o promocional). So grava com confirm=true."""
-    body = {"preco": preco}
-    if preco_promocional is not None:
-        body["precoPromocional"] = preco_promocional
-    if not confirm:
-        return {"previa": True, "aviso": "nada gravado — repita com confirm=true", "corpo": body}
-    return await _tiny_request("PUT", f"/produtos/{id_produto}/preco", json=body)
-
-
-@mcp.tool()
-async def chamar_api_tiny(metodo: str, caminho: str, params: dict = None,
-                          corpo: dict = None) -> dict:
-    """Passagem direta para a API v3 da Olist/Tiny, para explorar endpoints ainda nao
-    embrulhados numa ferramenta propria.
-
-    metodo : GET, POST, PUT ou DELETE
-    caminho: caminho relativo a https://api.tiny.com.br/public-api/v3
-             ex. "/produtos", "/produtos/123/estrutura", "/pedidos"
-
-    Metodos de escrita (POST, PUT, DELETE) exigem que o caminho seja passado
-    explicitamente pelo usuario — nunca inferido.
-    """
-    m = (metodo or "GET").upper()
-    if m not in ("GET", "POST", "PUT", "DELETE"):
-        return {"erro": f"metodo invalido: {metodo}"}
-    if not caminho.startswith("/"):
-        caminho = "/" + caminho
-    kwargs = {}
-    if params:
-        kwargs["params"] = params
-    if corpo is not None:
-        kwargs["json"] = corpo
-    return await _tiny_request(m, caminho, **kwargs)
-
-
 # --------------------------------------------------------------------------
-# Rotas HTTP
+# Rotas HTTP auxiliares (fluxo OAuth de autorização única)
 # --------------------------------------------------------------------------
 
 async def authorize(request):
@@ -302,83 +434,198 @@ async def authorize(request):
 async def callback(request):
     code = request.query_params.get("code")
     if not code:
-        return HTMLResponse("<h1>Erro: codigo de autorizacao nao recebido.</h1>", status_code=400)
+        return HTMLResponse("<h1>Erro: código de autorização não recebido.</h1>", status_code=400)
     await _exchange_code_for_tokens(code)
-    return HTMLResponse("<h1>Conectado com sucesso a Olist/Tiny. Pode fechar esta aba.</h1>")
+    return HTMLResponse("<h1>Conectado com sucesso à Olist/Tiny. Pode fechar esta aba.</h1>")
 
 
 async def health(request):
-    autorizado = TOKENS_PATH.exists()
-    return JSONResponse({"status": "ok", "versao": "v2-sem-oauth", "olist_autorizado": autorizado})
+    return JSONResponse({"status": "ok"})
 
 
-async def sem_oauth(request):
-    """As rotas de descoberta de OAuth respondem 404 de proposito: este servidor usa
-    segredo fixo, nao OAuth. Sem isso o cliente MCP tenta registro dinamico e falha."""
-    return JSONResponse({"erro": "este servidor nao usa OAuth"}, status_code=404)
+# --------------------------------------------------------------------------
+# OAuth2 (Authorization Code + PKCE) para o PRÓPRIO Claude autenticar com
+# este servidor. Fica em /oauth/* de propósito, pra não colidir com
+# /authorize e /callback usados acima no fluxo com a Olist/Tiny.
+# --------------------------------------------------------------------------
+
+# code -> {"code_challenge": str, "redirect_uri": str, "expires_at": float}
+# Armazenamento em memória: cada code é de uso único e expira em minutos,
+# então não precisa persistir em disco.
+_AUTH_CODES: dict[str, dict] = {}
 
 
-PUBLIC_PATHS = {"/health", "/authorize", "/callback", "/favicon.ico"}
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-class SegredoMiddleware(BaseHTTPMiddleware):
-    """Protege as ferramentas MCP com um segredo fixo, aceito de duas formas:
-      - cabecalho  Authorization: Bearer <MCP_SECRET>
-      - parametro  ?t=<MCP_SECRET>   (e o que permite conectar pela claude.ai)
+async def oauth_metadata(request):
+    return JSONResponse(
+        {
+            "issuer": PUBLIC_URL,
+            "authorization_endpoint": f"{PUBLIC_URL}/oauth/authorize",
+            "token_endpoint": f"{PUBLIC_URL}/oauth/token",
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+            ],
+        }
+    )
 
-    Responde 403 quando falta o segredo. Nunca 401: o 401 dispara a descoberta de
-    OAuth no cliente, que e exatamente o que queremos evitar aqui.
-    """
+
+async def oauth_protected_resource(request):
+    return JSONResponse(
+        {
+            "resource": f"{PUBLIC_URL}/mcp",
+            "authorization_servers": [PUBLIC_URL],
+        }
+    )
+
+
+async def oauth_authorize(request):
+    """Primeira perna do Authorization Code + PKCE. Como este servidor é de
+    uso pessoal (um único usuário/empresa), aprova automaticamente — não há
+    tela de login/consentimento separada."""
+    q = request.query_params
+    if q.get("client_id") != OAUTH_CLIENT_ID:
+        return PlainTextResponse("client_id inválido", status_code=400)
+    redirect_uri = q.get("redirect_uri")
+    if not redirect_uri:
+        return PlainTextResponse("redirect_uri obrigatório", status_code=400)
+
+    code = secrets.token_urlsafe(32)
+    _AUTH_CODES[code] = {
+        "code_challenge": q.get("code_challenge", ""),
+        "redirect_uri": redirect_uri,
+        "expires_at": time.time() + 600,
+    }
+    sep = "&" if "?" in redirect_uri else "?"
+    dest = f"{redirect_uri}{sep}code={code}"
+    if q.get("state"):
+        dest += f"&state={q['state']}"
+    return RedirectResponse(dest)
+
+
+async def oauth_token(request):
+    """Segunda perna: troca o code (+ code_verifier do PKCE) por um access
+    token. Também aceita grant_type=refresh_token (devolve o mesmo token,
+    já que ele não expira de fato — simplificação razoável pra um servidor
+    de uso interno de uma pessoa só)."""
+    form = await request.form()
+    grant_type = form.get("grant_type")
+
+    client_id = None
+    client_secret = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode()
+            client_id, _, client_secret = decoded.partition(":")
+        except Exception:
+            pass
+    if client_id is None:
+        client_id = form.get("client_id")
+        client_secret = form.get("client_secret")
+
+    if client_id != OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET or client_secret != OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    if grant_type == "refresh_token":
+        return JSONResponse(
+            {"access_token": MCP_SECRET, "token_type": "Bearer", "expires_in": 34560000}
+        )
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    code = form.get("code")
+    entry = _AUTH_CODES.pop(code, None)
+    if not entry or entry["expires_at"] < time.time():
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    code_verifier = form.get("code_verifier", "")
+    expected_challenge = _b64url(hashlib.sha256(code_verifier.encode()).digest())
+    if entry["code_challenge"] and expected_challenge != entry["code_challenge"]:
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE mismatch"}, status_code=400)
+
+    return JSONResponse(
+        {
+            "access_token": MCP_SECRET,
+            "token_type": "Bearer",
+            "expires_in": 34560000,
+            "refresh_token": MCP_SECRET,
+        }
+    )
+
+
+# Rotas que não exigem o bearer token: healthcheck, o fluxo OAuth com a
+# Olist/Tiny, e a negociação OAuth do próprio Claude com este servidor.
+PUBLIC_PATHS = {
+    "/health",
+    "/authorize",
+    "/callback",
+    "/favicon.ico",
+    "/oauth/authorize",
+    "/oauth/token",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+}
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Protege as ferramentas MCP com um token fixo (MCP_SECRET). Sem isso,
+    qualquer pessoa que descobrisse a URL do serviço conseguiria consultar e
+    alterar pedidos/estoque/preço na Olist sem nenhuma autenticação."""
 
     async def dispatch(self, request, call_next):
-        caminho = request.url.path
-        if caminho in PUBLIC_PATHS or caminho.startswith("/.well-known") or caminho.startswith("/oauth"):
+        if request.url.path in PUBLIC_PATHS:
             return await call_next(request)
         if not MCP_SECRET:
-            return PlainTextResponse("MCP_SECRET nao configurado no servidor.", status_code=500)
-        cabecalho = request.headers.get("authorization", "")
-        na_url = request.query_params.get("t", "")
-        if cabecalho == f"Bearer {MCP_SECRET}" or na_url == MCP_SECRET:
-            return await call_next(request)
-        return PlainTextResponse("Acesso negado: segredo ausente ou invalido.", status_code=403)
+            return PlainTextResponse(
+                "MCP_SECRET não configurado no servidor.", status_code=500
+            )
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {MCP_SECRET}":
+            return PlainTextResponse(
+                "Unauthorized",
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer resource_metadata="{PUBLIC_URL}/.well-known/oauth-protected-resource"'
+                    )
+                },
+            )
+        return await call_next(request)
 
 
-from contextlib import asynccontextmanager
-
-_mcp_app = mcp.streamable_http_app()
-
-
-@asynccontextmanager
-async def lifespan(_app):
-    """Sobe o gerenciador de sessoes do MCP junto com a aplicacao. Sem isso o /mcp
-    responde 'Task group is not initialized' na primeira requisicao, porque o Mount
-    do Starlette nao propaga o lifespan da sub-aplicacao."""
-    gerenciador = getattr(mcp, "session_manager", None)
-    if gerenciador is None:  # SDK antigo: cai para o lifespan da sub-aplicacao
-        async with _mcp_app.router.lifespan_context(_mcp_app):
-            yield
-        return
-    async with gerenciador.run():
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    # Sem isso, o session_manager do FastMCP nunca inicializa seu task
+    # group interno e toda chamada em /mcp cai com "Task group is not
+    # initialized" — só funciona quando o lifespan é propagado assim.
+    async with mcp.session_manager.run():
         yield
 
 
 app = Starlette(
-    lifespan=lifespan,
     routes=[
         Route("/authorize", authorize),
         Route("/callback", callback),
         Route("/health", health),
-        Route("/.well-known/oauth-authorization-server", sem_oauth),
-        Route("/.well-known/oauth-protected-resource", sem_oauth),
-        Route("/.well-known/openid-configuration", sem_oauth),
-        Route("/oauth/authorize", sem_oauth),
-        Route("/oauth/token", sem_oauth),
-        Route("/oauth/register", sem_oauth, methods=["GET", "POST"]),
-        Route("/register", sem_oauth, methods=["GET", "POST"]),
-    ]
+        Route("/oauth/authorize", oauth_authorize),
+        Route("/oauth/token", oauth_token, methods=["POST"]),
+        Route("/.well-known/oauth-authorization-server", oauth_metadata),
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+    ],
+    lifespan=lifespan,
 )
-app.add_middleware(SegredoMiddleware)
-app.mount("/", _mcp_app)
+app.add_middleware(BearerAuthMiddleware)
+
+# Monta o servidor MCP (transporte HTTP em streaming) na mesma app, em /mcp
+app.mount("/", mcp.streamable_http_app())
 
 
 if __name__ == "__main__":
