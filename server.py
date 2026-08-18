@@ -241,6 +241,123 @@ async def atualizar_preco(id_produto: str, preco: float, preco_promocional: floa
     return await _tiny_request("PUT", f"/produtos/{id_produto}/preco", json=body)  # validar contra docs
 
 
+@mcp.tool()
+async def criar_produto(
+    sku: str,
+    descricao: str,
+    tipo: str = "S",
+    unidade: str = "",
+    ncm: str = "",
+    gtin: str = "",
+    observacoes: str = "",
+    id_categoria: str = "",
+    id_marca: str = "",
+    id_fornecedor: str = "",
+    codigo_produto_no_fornecedor: str = "",
+    preco: float = None,
+    preco_promocional: float = None,
+    preco_custo: float = None,
+    estoque_inicial: float = None,
+    estoque_minimo: float = None,
+    estoque_maximo: float = None,
+    localizacao: str = "",
+    grade: list[str] = None,
+    variacoes: list[dict] = None,
+) -> dict:
+    """Cria um novo produto na Olist/Tiny.
+
+    Confirmado contra a documentação oficial
+    https://api-docs.erp.olist.com/api-reference/produtos/criar-produto
+    (POST /produtos).
+
+    sku / descricao: obrigatórios sempre.
+    tipo: 'S' Simples (default), 'K' Kit, 'V' Com Variações, 'F' Fabricado,
+      'M' Matéria-prima. Kit/Fabricado precisam de parâmetros adicionais que
+      esta ferramenta ainda não cobre (usar o painel da Tiny nesses casos).
+    id_fornecedor: ID do contato fornecedor (use listar_contatos pra achar).
+      Vincula o fornecedor ao produto (marcado como fornecedor padrão).
+    grade: obrigatório quando tipo='V'. Lista das chaves da grade de
+      variação, ex.: ["Cor"] ou ["Tamanho", "Cor"].
+    variacoes: obrigatório quando tipo='V'. Lista de dicts, cada um com:
+        {"sku": "...", "grade": [{"chave": "Cor", "valor": "Branco"}],
+         "preco": 119.90, "estoque_inicial": 10, "gtin": "..." (opcional)}
+      As chaves em cada "grade" de variação devem bater com o parâmetro
+      `grade` do produto pai.
+
+    Retorna: id, codigo e descricao do produto criado. Se tipo='V', também
+      retorna a lista de variacoes criadas (cada uma com seu próprio id).
+    """
+    if tipo not in ("S", "K", "V", "F", "M"):
+        raise ValueError("tipo deve ser um de: S, K, V, F, M")
+    if tipo == "V" and (not grade or not variacoes):
+        raise ValueError("tipo='V' exige 'grade' e 'variacoes' preenchidos.")
+
+    body: dict = {"sku": sku, "descricao": descricao, "tipo": tipo}
+    if unidade:
+        body["unidade"] = unidade
+    if ncm:
+        body["ncm"] = ncm
+    if gtin:
+        body["gtin"] = gtin
+    if observacoes:
+        body["observacoes"] = observacoes
+    if id_categoria:
+        body["categoria"] = {"id": id_categoria}
+    if id_marca:
+        body["marca"] = {"id": id_marca}
+
+    precos = {}
+    if preco is not None:
+        precos["preco"] = preco
+    if preco_promocional is not None:
+        precos["precoPromocional"] = preco_promocional
+    if preco_custo is not None:
+        precos["precoCusto"] = preco_custo
+    if precos:
+        body["precos"] = precos
+
+    if id_fornecedor:
+        fornecedor = {"id": id_fornecedor, "padrao": True}
+        if codigo_produto_no_fornecedor:
+            fornecedor["codigoProdutoNoFornecedor"] = codigo_produto_no_fornecedor
+        body["fornecedores"] = [fornecedor]
+
+    estoque = {}
+    if estoque_inicial is not None:
+        estoque["inicial"] = estoque_inicial
+    if estoque_minimo is not None:
+        estoque["minimo"] = estoque_minimo
+    if estoque_maximo is not None:
+        estoque["maximo"] = estoque_maximo
+    if localizacao:
+        estoque["localizacao"] = localizacao
+    if estoque:
+        body["estoque"] = estoque
+
+    if tipo == "V":
+        body["grade"] = grade
+        body_variacoes = []
+        for var in variacoes:
+            if "sku" not in var or "grade" not in var:
+                raise ValueError(f"Variação sem 'sku' ou 'grade': {var}")
+            body_var: dict = {"sku": var["sku"], "grade": var["grade"]}
+            if var.get("gtin"):
+                body_var["gtin"] = var["gtin"]
+            var_precos = {}
+            if var.get("preco") is not None:
+                var_precos["preco"] = var["preco"]
+            if var.get("preco_promocional") is not None:
+                var_precos["precoPromocional"] = var["preco_promocional"]
+            if var_precos:
+                body_var["precos"] = var_precos
+            if var.get("estoque_inicial") is not None:
+                body_var["estoque"] = {"inicial": var["estoque_inicial"]}
+            body_variacoes.append(body_var)
+        body["variacoes"] = body_variacoes
+
+    return await _tiny_request("POST", "/produtos", json=body)
+
+
 # --------------------------------------------------------------------------
 # Contatos (fornecedores e clientes) — adicionado 17/08/2026, deployment Plana
 # Endpoints confirmados contra https://api-docs.erp.olist.com/api-reference/contatos/
