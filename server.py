@@ -92,6 +92,13 @@ async def _exchange_code_for_tokens(code: str):
                 "client_secret": TINY_CLIENT_SECRET,
             },
         )
+        error_body = None
+        if resp.status_code >= 400:
+            try:
+                error_body = resp.text()
+            except Exception:
+                error_body = "[Erro ao ler corpo da resposta]"
+            print(f"[TINY TOKEN ERROR] POST {TINY_AUTH_BASE}/token: {resp.status_code} | Body: {error_body}")
         resp.raise_for_status()
         _save_tokens(resp.json())
 
@@ -113,7 +120,14 @@ async def _refresh_tokens():
                 "client_secret": TINY_CLIENT_SECRET,
             },
         )
-        resp.raise_for_status()
+        error_body = None
+        if resp.status_code >= 400:
+            try:
+                error_body = resp.text()
+            except Exception:
+                error_body = "[Erro ao ler corpo da resposta]"
+            print(f"[TINY TOKEN ERROR] POST {TINY_AUTH_BASE}/token (refresh): {resp.status_code} | Body: {error_body}")
+            raise RuntimeError(f"Refresh token falhou: {resp.status_code} - {error_body}") from resp.raise_for_status()
         new_tokens = resp.json()
         # Tiny nem sempre devolve um novo refresh_token; mantém o antigo se faltar
         new_tokens.setdefault("refresh_token", tokens["refresh_token"])
@@ -141,7 +155,14 @@ async def _tiny_request(method: str, path: str, **kwargs) -> dict:
     headers["Authorization"] = f"Bearer {token}"
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.request(method, f"{TINY_API_BASE}{path}", headers=headers, **kwargs)
-        resp.raise_for_status()
+        error_body = None
+        if resp.status_code >= 400:
+            try:
+                error_body = resp.text()
+            except Exception:
+                error_body = "[Erro ao ler corpo da resposta]"
+            print(f"[TINY API ERROR] {method} {TINY_API_BASE}{path}: {resp.status_code} | Body: {error_body}")
+            raise RuntimeError(f"Tiny API error: {resp.status_code} - {error_body}") from resp.raise_for_status()
         return resp.json()
 
 
@@ -748,3 +769,4 @@ app.mount("/", mcp.streamable_http_app())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
