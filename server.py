@@ -24,6 +24,7 @@ confirmados contra a documentação oficial https://api-docs.erp.olist.com/
 (seções "Ordem de Compra" e "Contatos"), não são mais "validar contra docs".
 """
 
+import asyncio
 import base64
 import contextlib
 import datetime
@@ -718,13 +719,31 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+async def _keepalive_tokens():
+    """Renova o token do Tiny a cada 2h, mesmo sem ninguem usar o conector.
+    O refresh_token do Tiny expira se ficar ~1 dia sem uso; isso evita
+    ter que reautorizar em /authorize."""
+    while True:
+        try:
+            if _load_tokens():
+                await _refresh_tokens()
+                print("keepalive: token do Tiny renovado", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"keepalive: falha ao renovar token: {e}", flush=True)
+        await asyncio.sleep(2 * 60 * 60)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     # Sem isso, o session_manager do FastMCP nunca inicializa seu task
     # group interno e toda chamada em /mcp cai com "Task group is not
     # initialized" — só funciona quando o lifespan é propagado assim.
     async with mcp.session_manager.run():
-        yield
+        task = asyncio.create_task(_keepalive_tokens())
+        try:
+            yield
+        finally:
+            task.cancel()
 
 
 app = Starlette(
