@@ -176,7 +176,7 @@ async def listar_pedidos(situacao: str = "", data_inicial: str = "", data_final:
         hoje = datetime.date.today()
         data_final = hoje.isoformat()
         data_inicial = (hoje - datetime.timedelta(days=30)).isoformat()
-    params = {"pagina": pagina}
+    params = {"limit": 100, "offset": (max(1, int(pagina or 1)) - 1) * 100}
     if situacao:
         params["situacao"] = situacao
     if data_inicial:
