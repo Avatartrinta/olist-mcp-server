@@ -226,14 +226,19 @@ async def obter_produto(id_produto: str) -> dict:
 
 
 @mcp.tool()
-async def atualizar_estoque(id_produto: str, quantidade: float, tipo: str = "B", deposito: str = "") -> dict:
+async def atualizar_estoque(id_produto: str, quantidade: float, tipo: str = "B", deposito: str = "",
+                            preco_unitario: float = 0, observacoes: str = "") -> dict:
     """Atualiza o estoque de um produto.
     tipo: 'B' = define o saldo (balanço), 'E' = entrada, 'S' = saída.
-    deposito: nome/ID do depósito, se a conta usar múltiplos depósitos."""
-    body = {"produto": {"id": id_produto}, "tipo": tipo, "quantidade": quantidade}
+    deposito: ID do depósito (ver chamar_api_tiny GET /depositos), se a conta usar vários.
+    preco_unitario: custo unitário da movimentação (obrigatório na API; 0 se não souber)."""
+    # Corpo conforme swagger oficial: tipo, quantidade, precoUnitario obrigatórios
+    body = {"tipo": tipo, "quantidade": quantidade, "precoUnitario": preco_unitario}
     if deposito:
-        body["deposito"] = {"nome": deposito}
-    return await _tiny_request("POST", f"/estoque/{id_produto}", json=body)  # validar contra docs
+        body["deposito"] = {"id": int(deposito)}
+    if observacoes:
+        body["observacoes"] = observacoes
+    return await _tiny_request("POST", f"/estoque/{id_produto}", json=body)
 
 
 @mcp.tool()
@@ -604,6 +609,144 @@ def _item_lista(i: dict) -> dict:
     if pp is not None:
         item["precoPromocional"] = float(pp)
     return item
+
+
+# --------------------------------------------------------------------------
+# Acesso completo à API v3 (todos os 216 endpoints)
+# --------------------------------------------------------------------------
+# O catálogo vem do swagger oficial da Olist, baixado na primeira chamada e
+# guardado no volume. Com isso o Claude descobre qualquer endpoint (financeiro,
+# notas, CRM, orçamentos, expedição, custos de produto...) e chama direto.
+
+SWAGGER_URL = "https://erp.olist.com/public-api/v3/swagger/swagger-mintlify.json"
+SWAGGER_PATH = DATA_DIR / "tiny_swagger.json"
+_swagger_cache: dict = {}
+
+
+async def _swagger(forcar: bool = False) -> dict:
+    global _swagger_cache
+    if _swagger_cache and not forcar:
+        return _swagger_cache
+    if SWAGGER_PATH.exists() and not forcar and time.time() - SWAGGER_PATH.stat().st_mtime < 7 * 86400:
+        _swagger_cache = json.loads(SWAGGER_PATH.read_text())
+        return _swagger_cache
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(SWAGGER_URL)
+        resp.raise_for_status()
+        SWAGGER_PATH.write_text(resp.text)
+        _swagger_cache = resp.json()
+    return _swagger_cache
+
+
+def _resolver(obj, spec, profundidade=0):
+    """Resolve $ref do swagger (com limite de profundidade)."""
+    if profundidade > 16:
+        return obj
+    if isinstance(obj, dict):
+        if "$ref" in obj:
+            partes = obj["$ref"].lstrip("#/").split("/")
+            alvo = spec
+            for p in partes:
+                alvo = alvo.get(p, {})
+            return _resolver(alvo, spec, profundidade + 1)
+        return {k: _resolver(v, spec, profundidade + 1) for k, v in obj.items()
+                if k not in ("example", "examples")}
+    if isinstance(obj, list):
+        return [_resolver(v, spec, profundidade + 1) for v in obj]
+    return obj
+
+
+@mcp.tool()
+async def catalogo_api_tiny(secao: str = "", busca: str = "") -> dict:
+    """Lista TODOS os endpoints da API v3 da Olist/Tiny (216), agrupados por seção.
+    Use para descobrir o que dá pra fazer além das ferramentas prontas.
+
+    secao: filtra pela seção (ex.: 'Produtos', 'Notas', 'Pedidos', 'Contas a pagar',
+      'Contas a receber', 'Orcamentos', 'CRM', 'Expedição', 'Separação', 'Estoque',
+      'Lista de Preços', 'Caixa', 'Extrato Bancário', 'Vendedores', 'Marcas'...).
+    busca: filtra por texto no resumo ou no caminho (ex.: 'custo', 'danfe').
+    Depois use detalhes_endpoint_tiny para ver parâmetros/corpo e
+    chamar_api_tiny para executar."""
+    spec = await _swagger()
+    saida: dict = {}
+    for caminho, metodos in spec.get("paths", {}).items():
+        for metodo, op in metodos.items():
+            if metodo not in ("get", "post", "put", "delete", "patch"):
+                continue
+            tag = (op.get("tags") or ["Outros"])[0]
+            resumo = op.get("summary", "")
+            if secao and secao.lower() not in tag.lower():
+                continue
+            if busca and busca.lower() not in (resumo + " " + caminho).lower():
+                continue
+            saida.setdefault(tag, []).append(f"{metodo.upper()} {caminho} — {resumo}")
+    return {"total": sum(len(v) for v in saida.values()), "secoes": saida}
+
+
+@mcp.tool()
+async def detalhes_endpoint_tiny(metodo: str, caminho: str) -> dict:
+    """Mostra parâmetros (path/query) e o formato do corpo (JSON) de um endpoint
+    da API v3, exatamente como no swagger oficial.
+    metodo: GET/POST/PUT/DELETE. caminho: como aparece no catálogo,
+    ex.: '/produtos/{idProduto}/custos'."""
+    spec = await _swagger()
+    op = spec.get("paths", {}).get(caminho, {}).get(metodo.lower())
+    if not op:
+        return {"erro": "endpoint não encontrado no catálogo", "dica": "use catalogo_api_tiny"}
+    op = _resolver(op, spec)
+    params = [
+        {"nome": p.get("name"), "em": p.get("in"), "obrigatorio": p.get("required", False),
+         "tipo": (p.get("schema") or {}).get("type"), "descricao": p.get("description", "")}
+        for p in op.get("parameters", [])
+    ]
+    corpo = (((op.get("requestBody") or {}).get("content") or {}).get("application/json") or {}).get("schema")
+    resposta = ((((op.get("responses") or {}).get("200") or (op.get("responses") or {}).get("201") or {})
+                 .get("content") or {}).get("application/json") or {}).get("schema")
+    return {"metodo": metodo.upper(), "caminho": caminho, "resumo": op.get("summary"),
+            "parametros": params, "corpo": corpo, "resposta": resposta}
+
+
+@mcp.tool()
+async def chamar_api_tiny(metodo: str, caminho: str, params: dict = None, corpo: dict = None) -> dict:
+    """Executa QUALQUER endpoint da API v3 da Olist/Tiny (ver catalogo_api_tiny).
+
+    metodo: GET, POST, PUT, PATCH ou DELETE.
+    caminho: com os IDs já preenchidos, ex.: '/produtos/890089582/custos',
+      '/notas', '/contas-pagar', '/orcamentos/123/gerar-pedido'.
+    params: query string (ex.: {"limit": 100, "offset": 0, "dataInicial": "2026-09-01"}).
+    corpo: JSON do corpo para POST/PUT/PATCH (ver detalhes_endpoint_tiny).
+
+    ATENÇÃO: POST/PUT/PATCH/DELETE alteram dados reais do ERP (ex.: emitir ou
+    cancelar nota, baixar conta, excluir produto). Confirme com o usuário antes
+    de executar ações irreversíveis.
+    Em caso de erro devolve o status e a mensagem da Tiny, em vez de falhar."""
+    metodo = metodo.upper()
+    if metodo not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        return {"erro": f"método inválido: {metodo}"}
+    if not caminho.startswith("/"):
+        caminho = "/" + caminho
+    kwargs = {}
+    if params:
+        kwargs["params"] = params
+    if corpo is not None and metodo in ("POST", "PUT", "PATCH", "DELETE"):
+        kwargs["json"] = corpo
+    try:
+        return await _tiny_request(metodo, caminho, **kwargs)
+    except httpx.HTTPStatusError as e:
+        try:
+            detalhe = e.response.json()
+        except Exception:  # noqa: BLE001
+            detalhe = e.response.text[:2000]
+        return {"erro": True, "status": e.response.status_code, "detalhe": detalhe}
+
+
+@mcp.tool()
+async def listar_custos_produto(id_produto: str, pagina: int = 1, limite: int = 100) -> dict:
+    """Histórico de custos de um produto (entradas por nota/ordem de compra),
+    base para calcular margem."""
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    return await chamar_api_tiny("GET", f"/produtos/{id_produto}/custos", params=params)
 
 
 @mcp.tool()
