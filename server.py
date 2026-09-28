@@ -143,6 +143,9 @@ async def _tiny_request(method: str, path: str, **kwargs) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.request(method, f"{TINY_API_BASE}{path}", headers=headers, **kwargs)
         resp.raise_for_status()
+        # PUT/DELETE da Tiny (ex.: listas de preços) respondem 204 sem corpo
+        if resp.status_code == 204 or not resp.content:
+            return {"ok": True, "status": resp.status_code}
         return resp.json()
 
 
@@ -521,6 +524,86 @@ async def atualizar_situacao_ordem_compra(id_ordem_compra: str, situacao: int) -
     return await _tiny_request(
         "PUT", f"/ordem-compra/{id_ordem_compra}/situacao", json={"situacao": situacao}
     )
+
+
+# --------------------------------------------------------------------------
+# Listas de preços (API v3: /listas-precos)
+# --------------------------------------------------------------------------
+
+@mcp.tool()
+async def listar_listas_precos(nome: str = "", pagina: int = 1, limite: int = 100) -> dict:
+    """Lista as listas de preços cadastradas (id, descricao, acrescimoDesconto).
+    nome: filtra por nome parcial da lista."""
+    limite = max(1, min(limite, 100))
+    params = {"limit": limite, "offset": (max(1, pagina) - 1) * limite}
+    if nome:
+        params["nome"] = nome
+    return await _tiny_request("GET", "/listas-precos", params=params)
+
+
+@mcp.tool()
+async def obter_lista_precos(id_lista: str, id_produto: str = "") -> dict:
+    """Retorna uma lista de preços com suas exceções (produtos com preço
+    próprio): idProduto, codigo (SKU), preco, precoPromocional.
+    id_produto: opcional, filtra a exceção de um produto específico."""
+    params = {"idProduto": id_produto} if id_produto else None
+    return await _tiny_request("GET", f"/listas-precos/{id_lista}", params=params)
+
+
+@mcp.tool()
+async def criar_lista_precos(descricao: str, acrescimo_desconto: float = None,
+                             itens: list[dict] = None) -> dict:
+    """Cria uma lista de preços.
+    acrescimo_desconto: % sobre o preço base (positivo acréscimo, negativo desconto).
+    itens: exceções por produto, ex. [{"id_produto": "123", "preco": 19.9,
+      "preco_promocional": 0}]. Retorna o id da lista criada."""
+    body = {"descricao": descricao}
+    if acrescimo_desconto is not None:
+        body["acrescimoDesconto"] = acrescimo_desconto
+    if itens:
+        body["itens"] = [_item_lista(i) for i in itens]
+    return await _tiny_request("POST", "/listas-precos", json=body)
+
+
+@mcp.tool()
+async def atualizar_lista_precos(id_lista: str, itens: list[dict] = None,
+                                 descricao: str = "", acrescimo_desconto: float = None) -> dict:
+    """Atualiza uma lista de preços: inclui/altera preços de produtos (itens)
+    e/ou renomeia/muda o % de acréscimo-desconto.
+    itens: [{"id_produto": "123", "preco": 19.9, "preco_promocional": 0}, ...]
+    Produtos já existentes na lista têm o preço substituído; novos são incluídos."""
+    body = {}
+    if descricao:
+        body["descricao"] = descricao
+    if acrescimo_desconto is not None:
+        body["acrescimoDesconto"] = acrescimo_desconto
+    if itens:
+        body["itens"] = [_item_lista(i) for i in itens]
+    return await _tiny_request("PUT", f"/listas-precos/{id_lista}", json=body)
+
+
+@mcp.tool()
+async def excluir_produto_lista_precos(id_lista: str, ids_produtos: list[str]) -> dict:
+    """Remove um ou mais produtos de uma lista de preços (não apaga o produto
+    do cadastro, só tira da lista). Retorna o resultado por produto."""
+    resultado = {}
+    for idp in ids_produtos:
+        try:
+            await _tiny_request("DELETE", f"/listas-precos/{id_lista}/produtos/{idp}")
+            resultado[str(idp)] = "removido"
+        except httpx.HTTPStatusError as e:
+            resultado[str(idp)] = f"erro {e.response.status_code}: {e.response.text[:200]}"
+    return {"id_lista": id_lista, "resultado": resultado}
+
+
+def _item_lista(i: dict) -> dict:
+    item = {"idProduto": int(i.get("id_produto") or i.get("idProduto"))}
+    if i.get("preco") is not None:
+        item["preco"] = float(i["preco"])
+    pp = i.get("preco_promocional", i.get("precoPromocional"))
+    if pp is not None:
+        item["precoPromocional"] = float(pp)
+    return item
 
 
 @mcp.tool()
